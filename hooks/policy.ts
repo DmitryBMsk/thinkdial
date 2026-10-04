@@ -257,6 +257,16 @@ export function rankOf(model: string, tiers: Tiers): number | null {
   return null
 }
 
+/** Recheck the effort ceiling against the model on this request. */
+export function effortForModel(effort: Effort | undefined, model: string, config: PolicyConfig): Effort | null {
+  if (effort === undefined) return null
+  const ceiling = config.effortCeiling
+  if (ceiling && rankOf(model, config.tiers) !== TIER_ORDER.indexOf('deep') && effortRank(effort)! > effortRank(ceiling)!) {
+    return ceiling
+  }
+  return effort
+}
+
 /**
  * The full id a family alias names on the main loop.
  *
@@ -470,10 +480,13 @@ export function subagentEffortRouting(
   spawn: { decision: Decision | null; pinned: Effort | null },
   current: { model: string; effort?: string | number },
   config: PolicyConfig,
-  runtimePinned?: string,
+  sessionEffort?: string | number,
 ): Pick<Routing, 'effort' | 'reason'> {
-  const pinned = runtimePinned && effortRank(runtimePinned) !== null ? runtimePinned : spawn.pinned
-  if (pinned) return { effort: null, reason: `effort pinned by definition (${pinned})` }
+  if (spawn.pinned) return { effort: null, reason: `effort pinned by definition (${spawn.pinned})` }
+  // A definition pinned to the session's level cannot be distinguished here.
+  if (current.effort !== undefined && sessionEffort !== undefined && current.effort !== sessionEffort) {
+    return { effort: null, reason: `effort set by agent definition (${current.effort}, session ${sessionEffort})` }
+  }
   if (current.effort === undefined) return { effort: null, reason: 'model takes no effort' }
   const { effort, reason } = route(spawn.decision, current, { ...config, routeModel: false })
   return { effort, reason }

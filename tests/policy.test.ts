@@ -8,6 +8,7 @@ import {
   definitionMatches,
   pluginAgentDirs,
   effortLevel,
+  effortForModel,
   effortRank,
   endpoint,
   questions,
@@ -627,11 +628,35 @@ test('definition effort accepts only supported frontmatter values', () => {
   expect(definitionEffort('---\neffort: lots\n---\n')).toBeNull()
 })
 
-test('runtime definition pin wins over a file pin and the classification', () => {
-  const spawn = { decision: deep(3), pinned: 'medium' as const }
-  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'low'), graded, 'high')).toEqual({
+test('a subagent effort different from the session is treated as a definition pin', () => {
+  const spawn = { decision: deep(3), pinned: null }
+  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'high'), graded, 'medium')).toEqual({
+    effort: null, reason: 'effort set by agent definition (high, session medium)',
+  })
+})
+
+test('an equal or unknown session effort does not imply a definition pin', () => {
+  const spawn = { decision: deep(3), pinned: null }
+  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'medium'), graded, 'medium').effort).toBe('xhigh')
+  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'medium'), graded).effort).toBe('xhigh')
+})
+
+test('a file pin wins even when session effort is unknown', () => {
+  const spawn = { decision: deep(3), pinned: 'high' as const }
+  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'high'), graded)).toEqual({
     effort: null, reason: 'effort pinned by definition (high)',
   })
+})
+
+test('cached effort is capped when a later request falls back to a balanced or unknown model', () => {
+  expect(effortForModel('xhigh', 'claude-sonnet-5-5', graded)).toBe('high')
+  expect(effortForModel('xhigh', 'unlisted-model', graded)).toBe('high')
+})
+
+test('cached effort remains on deep models and without a configured ceiling', () => {
+  expect(effortForModel('xhigh', 'claude-opus-5-5', graded)).toBe('xhigh')
+  expect(effortForModel('xhigh', 'claude-sonnet-5-5', config)).toBe('xhigh')
+  expect(effortForModel(undefined, 'claude-sonnet-5-5', graded)).toBeNull()
 })
 
 test('a file definition pin keeps the subagent effort', () => {

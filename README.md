@@ -28,7 +28,7 @@ A subagent's routing is measured from the model it would run on untouched: the A
 
 ## Subagent effort
 
-The Agent tool has no effort parameter. The router classifies a Claude subagent at `agent.spawn`, then applies its effort at that subagent's first `turn.step`. The choice is reused for later steps and turns of the same agent. An `effort:` value in the agent definition keeps that agent's own setting, including when the runtime exposes the definition's value. A model whose request has no effort setting receives no effort override. Forks, Codex delegations, and agents without a matching spawn are left alone. The same effort floors and ceiling used for the main loop apply, based on the subagent's actual model.
+The Agent tool has no effort parameter. The router classifies a Claude subagent at `agent.spawn`, then applies its effort at that subagent's first `turn.step`. The choice is reused for later steps and turns of the same agent. An `effort:` value found in the agent's file definition keeps that setting. The router also keeps a subagent's effort when its first request differs from the session effort. A definition pinned to the same level as the session cannot be detected this way and may be routed. A model whose request has no effort setting receives no effort override. Forks, Codex delegations, and agents without a matching spawn are left alone. The effort ceiling is checked against the model on every request, including after a fallback.
 
 **Both directions, both dimensions.** A task read as mechanical is routed down; one read as hard is routed up for the routing switches that are enabled.
 

@@ -57,6 +57,7 @@ import {
   gateMainModel,
   rankOf,
   endpoint,
+  effortForModel,
   pendingDecisions,
   readDecision,
   selectProvider,
@@ -175,6 +176,7 @@ export const register: Register = (on, options) => {
   const pendingSpawns = new Map<string, SpawnDecision>()
   // Null also records a miss, so unknown agents never wait a second time.
   const subagentEffortById = new Map<string, Effort | null>()
+  let sessionEffort: string | number | undefined
   // A first step can overtake the agent.spawn continuation that gives us its id.
   const startingSpawns = new Set<Promise<unknown>>()
 
@@ -290,12 +292,7 @@ export const register: Register = (on, options) => {
           pendingSpawns.delete(e.agentId)
           subagentEffortById.set(e.agentId, null)
           if (spawn) {
-            // AgentInfo.effort is assumed to be the definition's pin; a live
-            // session check is still pending.
-            const info = (await $.agent.list()).find((agent) => agent.id === e.agentId) as
-              | ({ effort?: unknown } & { id: string }) | undefined
-            const runtimePinned = typeof info?.effort === 'string' ? info.effort : undefined
-            const routing = subagentEffortRouting(spawn, { model: e.model, effort: e.effort }, subagentEffortPolicy, runtimePinned)
+            const routing = subagentEffortRouting(spawn, { model: e.model, effort: e.effort }, subagentEffortPolicy, sessionEffort)
             const effort = routing.effort
             const applied = spawn.model || effort
               ? { ...(spawn.model ? { model: spawn.model } : {}), ...(effort ? { effort } : {}) }
@@ -304,7 +301,8 @@ export const register: Register = (on, options) => {
               ? `model: ${spawn.modelReason}; effort: ${routing.reason}` : routing.reason
             record($, decisionLog, {
               event: 'subagent', agentId: e.agentId, agentType: spawn.agentType, ...spawn.decision,
-              from: { model: e.model, effort: e.effort, source: spawn.source },
+              from: { model: spawn.fromModel, effort: e.effort, source: spawn.source },
+              ...(e.model !== spawn.fromModel ? { ran: e.model } : {}),
               applied, reason,
             })
             if (logDecisions) $.ui.log(
@@ -314,7 +312,7 @@ export const register: Register = (on, options) => {
           }
         }
         const effort = subagentEffortById.get(e.agentId)
-        if (effort && e.effort !== undefined) request = { ...e, effort }
+        if (effort && e.effort !== undefined) request = { ...e, effort: effortForModel(effort, e.model, subagentEffortPolicy)! }
       } catch (error) {
         subagentEffortById.set(e.agentId, null)
         try {
@@ -325,6 +323,7 @@ export const register: Register = (on, options) => {
       }
       return yield* next(request)
     }
+    if (e.index === 0) sessionEffort = e.effort
     if (!routeMainLoop) return yield* next(e)
 
     // Every request after the first reuses what the turn settled on, so
@@ -332,7 +331,8 @@ export const register: Register = (on, options) => {
     if (e.index > 0 && e.turnId === appliedTurnId) {
       // A later request may have fallen back to a model without effort.
       const reused = applied && e.effort === undefined ? (applied.model ? { model: applied.model } : null) : applied
-      return yield* next(reused ? { ...e, ...reused } : e)
+      const capped = reused?.effort ? effortForModel(reused.effort, e.model, mainPolicy) : null
+      return yield* next(reused ? { ...e, ...reused, ...(capped ? { effort: capped } : {}) } : e)
     }
 
     baseModel ??= await startingModel($, e.model)
@@ -493,7 +493,7 @@ export const register: Register = (on, options) => {
       // pending decision that no later step will consume.
       if (started.agentId && !subagentEffortById.has(started.agentId)) pendingSpawns.set(started.agentId, {
         decision, pinned: definition?.effort ?? null, agentType: e.subagentType,
-        source, model, modelReason: routed ? reason : null,
+        source, fromModel: current, model, modelReason: routed ? reason : null,
       })
       return started
     })
@@ -517,6 +517,7 @@ type SpawnDecision = {
   pinned: Effort | null
   agentType: string
   source: 'call' | 'definition' | 'parent'
+  fromModel: string
   model: string | null
   modelReason: string | null
 }

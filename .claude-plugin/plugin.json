@@ -1,6 +1,6 @@
 {
   "name": "jev-model-router",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Picks the model and reasoning effort for each task with TypeSafe's Jev. Routes subagent models at agent.spawn and subagent and main-loop effort at turn.step, with optional main-loop model routing. Falls back to the engine's built-in classifier when no key is set.",
   "author": {
     "name": "claude-code-templates",
