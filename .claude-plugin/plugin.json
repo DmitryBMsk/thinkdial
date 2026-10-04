@@ -6,7 +6,7 @@
     "name": "Dmitrii Bakhtin",
     "url": "https://github.com/DmitryBMsk"
   },
-  "repository": "https://github.com/DmitryBMsk/jev-router",
+  "repository": "https://github.com/DmitryBMsk/thinkdial",
   "license": "MIT",
   "keywords": [
     "mod",
@@ -132,5 +132,5 @@
       "default": true
     }
   },
-  "homepage": "https://github.com/DmitryBMsk/jev-router#readme"
+  "homepage": "https://github.com/DmitryBMsk/thinkdial#readme"
 }

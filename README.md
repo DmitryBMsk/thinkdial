@@ -1,17 +1,17 @@
 <div align="center">
 
-# jev-router
+# thinkdial
 
-**Reasoning-effort calibration for Claude Code, decided per task by a typed decision model.**
+**Per-task reasoning effort for Claude Code, decided by a typed decision model.**
 
-[![tests](https://github.com/DmitryBMsk/jev-router/actions/workflows/test.yml/badge.svg)](https://github.com/DmitryBMsk/jev-router/actions/workflows/test.yml)
+[![tests](https://github.com/DmitryBMsk/thinkdial/actions/workflows/test.yml/badge.svg)](https://github.com/DmitryBMsk/thinkdial/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-2.1.259%2B-d97757)](https://github.com/anthropics/claude-code/tree/main/mods)
 [![runtime: bun](https://img.shields.io/badge/tests-bun-f9f1e1)](https://bun.sh)
 
 </div>
 
-`jev-router` is a Claude Code **mod** (a plugin of function hooks). Before each turn it asks [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), TypeSafe's System One decision model, three typed questions about the task: how hard is it, how much reasoning does it need, and is it risky. It then sets the **reasoning effort** of the request:
+`thinkdial` is a Claude Code **mod** (a plugin of function hooks). Before each turn it asks [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), TypeSafe's System One decision model, three typed questions about the task: how hard is it, how much reasoning does it need, and is it risky. It then sets the **reasoning effort** of the request:
 
 - of the **main conversation**,
 - of every **Claude subagent** the Agent tool starts,
@@ -19,7 +19,7 @@
 
 It does not change which model answers, unless you turn that on (see [why not](#why-effort-only)). Every failure path is fail-open: if the classification is slow, errors out or makes no sense, the request goes out exactly as Claude Code built it.
 
-> The plugin id is still `jev-model-router` (that is what Claude Code and your `pluginConfigs` know it by). The repository is `jev-router`.
+> The plugin id is still `jev-model-router` (that is what Claude Code and your `pluginConfigs` know it by). The project is `thinkdial`.
 
 ---
 
@@ -86,10 +86,10 @@ flowchart LR
 **Requirements:** Claude Code **2.1.259+**, function hooks enabled, and a [TypeSafe](https://typesafe.ai) API key. Without a key the router still runs on Claude Code's built-in classifier, which reports no confidence and so can only raise effort, never lower it.
 
 ```sh
-git clone https://github.com/DmitryBMsk/jev-router.git ~/src/jev-router
+git clone https://github.com/DmitryBMsk/thinkdial.git ~/src/thinkdial
 
 # load it for every project: a user-level skills folder is auto-loaded as jev-model-router@skills-dir
-ln -s ~/src/jev-router ~/.claude/skills/jev-model-router
+ln -s ~/src/thinkdial ~/.claude/skills/jev-model-router
 ```
 
 Add this to `~/.claude/settings.json`. These are the recommended effort-only settings, and the defaults in the code differ from them, as noted below:
@@ -125,12 +125,12 @@ Start `claude`. The first routed turn prints `[jev-model-router] ready on typesa
 <summary><b>One session only, or a headless worker</b></summary>
 
 ```sh
-CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/src/jev-router
+CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/src/thinkdial
 ```
 
 Loaded this way the plugin's id is plain `jev-model-router`, so its options go under `"pluginConfigs": { "jev-model-router": { … } }`, for example in a file passed with `--settings`. For an isolated `claude -p` worker use `--restricted`, not `--safe-mode`: `--safe-mode` also switches off hooks loaded with `--plugin-dir`.
 
-`claude plugin validate ~/src/jev-router` prints every event the plugin hooks and every `$` call it makes.
+`claude plugin validate ~/src/thinkdial` prints every event the plugin hooks and every `$` call it makes.
 
 </details>
 
