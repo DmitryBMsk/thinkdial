@@ -21,6 +21,7 @@ import {
   requestHeaders,
   requestModelId,
   route,
+  subagentEffortRouting,
   selectProvider,
   bareCommand,
 } from '../hooks/policy.ts'
@@ -97,6 +98,11 @@ test('effort moves in both directions too, on its own confidence', () => {
 test('a numeric effort is the caller\'s own scale and is left alone', () => {
   const decision = readDecision(gatewayAnswer('deep', { deep: 0.95 }, 0.01, 2.8))
   expect(route(decision, { model: 'claude-opus-5', effort: 4000 }, config).effort).toBeNull()
+})
+
+test('a model without effort never receives an effort parameter', () => {
+  const decision = readDecision(gatewayAnswer('deep', { deep: 0.95 }, 0.01, 2.8))
+  expect(route(decision, { model: 'claude-haiku-4-5-20251001' }, config).effort).toBeNull()
 })
 
 test('the rubric score maps onto the reasoning ladder', () => {
@@ -594,12 +600,22 @@ test('effort-only routing uses the model actually running for its ceiling', () =
   expect(route(deep(3), on('claude-sonnet-5-5', 'medium'), graded).model).toBe('opus')
 })
 
+test('an unknown running model still gets the effort-only ceiling', () => {
+  expect(route(deep(3), on('mystery-1', 'medium'), { ...graded, routeModel: false }).effort).toBe('high')
+})
+
 test('risk raises effort without changing the model when model routing is off', () => {
   const risky: Decision = { ...mechanical(0.01), risky: 0.9, effort: 0, effortConfidence: 0.01 }
   const result = route(risky, on('claude-sonnet-5-5', 'low'), { ...graded, routeModel: false })
   expect(result.model).toBeNull()
   expect(result.effort).toBe('high')
   expect(result.forced).toBe(true)
+  expect(result.reason).toBe('effort forced by risk')
+})
+
+test('effort-only routing exposes the model it would have chosen', () => {
+  const result = route(deep(3), on('claude-sonnet-5-5', 'medium'), { ...graded, routeModel: false })
+  expect(result.wantedModel).toBe('opus')
 })
 
 test('definition effort accepts only supported frontmatter values', () => {
@@ -609,4 +625,23 @@ test('definition effort accepts only supported frontmatter values', () => {
   expect(definitionEffort('---\nname: reviewer\n---\n')).toBeNull()
   expect(definitionEffort('---\neffort: 1000\n---\n')).toBeNull()
   expect(definitionEffort('---\neffort: lots\n---\n')).toBeNull()
+})
+
+test('runtime definition pin wins over a file pin and the classification', () => {
+  const spawn = { decision: deep(3), pinned: 'medium' as const }
+  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'low'), graded, 'high')).toEqual({
+    effort: null, reason: 'effort pinned by definition (high)',
+  })
+})
+
+test('a file definition pin keeps the subagent effort', () => {
+  const spawn = { decision: deep(3), pinned: 'medium' as const }
+  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'low'), graded).effort).toBeNull()
+})
+
+test('an unpinned subagent on a model without effort keeps the request untouched', () => {
+  const spawn = { decision: deep(3), pinned: null }
+  expect(subagentEffortRouting(spawn, on('claude-haiku-4-5'), graded)).toEqual({
+    effort: null, reason: 'model takes no effort',
+  })
 })

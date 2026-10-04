@@ -44,7 +44,8 @@ export interface Decision {
 /** The reasoning levels a turn can ask for, cheapest first. */
 export const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh'] as const
 
-export type Effort = (typeof EFFORT_ORDER)[number] | 'max'
+export type RoutedEffort = (typeof EFFORT_ORDER)[number]
+export type Effort = RoutedEffort | 'max'
 
 export const TIER_ORDER: readonly Tier[] = ['fast', 'balanced', 'deep']
 
@@ -219,9 +220,9 @@ function confidenceOf(answer: Record<string, unknown>): number | null {
 }
 
 /** The rubric score (0..3) as a reasoning level. */
-export function effortLevel(score: number): Effort {
+export function effortLevel(score: number): RoutedEffort {
   const index = Math.min(EFFORT_ORDER.length - 1, Math.max(0, Math.round(score)))
-  return EFFORT_ORDER[index] as Effort
+  return EFFORT_ORDER[index]!
 }
 
 /**
@@ -233,7 +234,7 @@ export function effortLevel(score: number): Effort {
 export function effortRank(effort: string | number | undefined): number | null {
   if (typeof effort !== 'string') return null
   if (effort === 'max') return EFFORT_ORDER.length
-  const index = EFFORT_ORDER.indexOf(effort as (typeof EFFORT_ORDER)[number])
+  const index = EFFORT_ORDER.findIndex((level) => level === effort)
   return index === -1 ? null : index
 }
 
@@ -335,6 +336,8 @@ export interface PolicyConfig {
 export interface Routing {
   /** The model to run on, or null to leave the request as it is. */
   model: string | null
+  /** The classified model even when this route cannot change it. */
+  wantedModel: string | null
   /** The reasoning level to ask for, or null to leave it as it is. */
   effort: Effort | null
   /** Why, for the log line. */
@@ -347,7 +350,7 @@ export interface Routing {
   forced: boolean
 }
 
-const NOTHING: Routing = { model: null, effort: null, reason: 'no decision', forced: false }
+const NOTHING: Routing = { model: null, wantedModel: null, effort: null, reason: 'no decision', forced: false }
 
 /**
  * Whether a change of rank passes its threshold. Both directions are allowed;
@@ -411,15 +414,17 @@ export function route(
       : null
 
   let effort: Effort | null = null
-  if (effortScore !== null) {
+  // An absent effort means this model cannot accept the API parameter.
+  if (effortScore !== null && current.effort !== undefined) {
     const currentRank = effortRank(current.effort)
-    let wantedRank = EFFORT_ORDER.indexOf(effortLevel(effortScore) as (typeof EFFORT_ORDER)[number])
+    let wantedRank = EFFORT_ORDER.indexOf(effortLevel(effortScore))
     const rankOfLevel = (level: Effort | undefined, none: number) => (level ? effortRank(level) ?? none : none)
     const floorRank = Math.max(
       rankOfLevel(config.effortFloor, 0),
       tier === 'balanced' ? rankOfLevel(config.balancedEffortFloor, 0) : 0,
     )
-    const runsTier = model ? wantedTier : (currentTier ?? wantedTier)
+    // An unknown model has no proof that it belongs to the deep tier.
+    const runsTier = model ? wantedTier : (currentTier ?? 0)
     const ceilingRank = runsTier < TIER_ORDER.indexOf('deep') ? rankOfLevel(config.effortCeiling, Infinity) : Infinity
     const lifted = wantedRank < floorRank && currentRank !== null && currentRank < floorRank
     const capped = currentRank !== null && currentRank > ceilingRank
@@ -433,7 +438,7 @@ export function route(
 
     // A numeric effort is the caller's own scale, not this ladder; leave it.
     const comparable = typeof current.effort !== 'number'
-    const wanted = EFFORT_ORDER[Math.min(EFFORT_ORDER.length - 1, wantedRank)] as Effort
+    const wanted = EFFORT_ORDER[Math.min(EFFORT_ORDER.length - 1, wantedRank)]!
     if (
       comparable &&
       wantedRank !== currentRank &&
@@ -453,11 +458,25 @@ export function route(
     const kept = `${current.model}${current.effort === undefined ? '' : `/${current.effort}`}`
     const wanted = `${wantedModel}${wantedEffort ? `/${wantedEffort}` : ''}`
     const floored = wantedTier > TIER_ORDER.indexOf(tier) ? `, ${tier} floored to ${TIER_ORDER[wantedTier]}` : ''
-    return { model: null, effort: null, reason: `kept ${kept}, wanted ${wanted}${floored} (${said})`, forced }
+    return { model: null, wantedModel, effort: null, reason: `kept ${kept}, wanted ${wanted}${floored} (${said})`, forced }
   }
 
   const label = wantedTier > TIER_ORDER.indexOf(tier) ? `${tier}, floored to ${TIER_ORDER[wantedTier]}` : tier
-  return { model, effort, reason: forced ? `${label}, forced by risk` : `${label} (${said})`, forced }
+  return { model, wantedModel, effort, reason: forced ? (config.routeModel === false ? 'effort forced by risk' : `${label}, forced by risk`) : `${label} (${said})`, forced }
+}
+
+/** One Claude subagent's effort decision, including definition pins. */
+export function subagentEffortRouting(
+  spawn: { decision: Decision | null; pinned: Effort | null },
+  current: { model: string; effort?: string | number },
+  config: PolicyConfig,
+  runtimePinned?: string,
+): Pick<Routing, 'effort' | 'reason'> {
+  const pinned = runtimePinned && effortRank(runtimePinned) !== null ? runtimePinned : spawn.pinned
+  if (pinned) return { effort: null, reason: `effort pinned by definition (${pinned})` }
+  if (current.effort === undefined) return { effort: null, reason: 'model takes no effort' }
+  const { effort, reason } = route(spawn.decision, current, { ...config, routeModel: false })
+  return { effort, reason }
 }
 
 /**

@@ -64,6 +64,7 @@ import {
   requestHeaders,
   requestModelId,
   route,
+  subagentEffortRouting,
   EFFORT_ORDER,
   TIER_ORDER,
   bareCommand,
@@ -124,6 +125,12 @@ export const register: Register = (on, options) => {
   // starting model, a floor raise or a risk-forced switch passes.
   const mainModelMaxContextTokens = number('mainModelMaxContextTokens', 80_000)
   const routeMainLoop = routeMainEffort || routeMainModel
+  const switches = {
+    subagentModel: routeSubagentModel,
+    subagentEffort: routeSubagentEffort,
+    mainEffort: routeMainEffort,
+    mainModel: routeMainModel,
+  }
   const logDecisions = flag('logDecisions', true)
   // The debug log exists only under --debug, so an interactive session leaves
   // no trace of what was routed. This one does: one JSONL file per session in
@@ -146,8 +153,8 @@ export const register: Register = (on, options) => {
     minDowngradeConfidence: number('minDowngradeConfidence', 0.6),
   }
   // The main loop answers the person directly and carries the whole session,
-  // so its model has a floor and a stricter bar to go down; subagents keep
-  // the ordinary policy, haiku included. Effort is routed on `policy`'s bars.
+  // so its model has a floor and a stricter bar to go down. Its effort has
+  // a floor and ceiling; subagent effort uses those same bounds.
   const mainFloor = text('mainModelFloor', 'balanced')
   const effortOption = (key: string): Effort | undefined => {
     const value = text(key, '')
@@ -163,9 +170,13 @@ export const register: Register = (on, options) => {
     effortCeiling: effortOption('mainEffortCeiling'),
   }
   const subagentEffortPolicy: PolicyConfig = { ...mainPolicy, routeModel: false }
-  const subagentEffort = new Map<string, { decision: Decision | null; pinned: Effort | null; agentType: string }>()
-  const subagentApplied = new Map<string, Effort | null>()
-  const inFlightSpawns = new Set<Promise<unknown>>()
+  // A spawn's classification and origin wait for its first request, where
+  // the resolved model and runtime definition are finally available.
+  const pendingSpawns = new Map<string, SpawnDecision>()
+  // Null also records a miss, so unknown agents never wait a second time.
+  const subagentEffortById = new Map<string, Effort | null>()
+  // A first step can overtake the agent.spawn continuation that gives us its id.
+  const startingSpawns = new Set<Promise<unknown>>()
 
   // The classification waiting for the turn that reads its prompt, and what
   // the current turn settled on. Both are single slots: main-loop turns run
@@ -195,12 +206,7 @@ export const register: Register = (on, options) => {
           `[jev-model-router] ${describeSetup(
             active,
             url,
-            {
-              subagentModel: routeSubagentModel,
-              subagentEffort: routeSubagentEffort,
-              mainEffort: routeMainEffort,
-              mainModel: routeMainModel,
-            },
+            switches,
             forced === 'builtin',
           )}`,
         )
@@ -273,48 +279,60 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     if (e.agentId) {
       if (!routeSubagentEffort) return yield* next(e)
-      let effort: Effort | null = null
+      let request = e
       try {
-        if (subagentApplied.has(e.agentId)) {
-          effort = subagentApplied.get(e.agentId) ?? null
-        } else {
-          if (!subagentEffort.has(e.agentId) && inFlightSpawns.size) {
-            await Promise.race([Promise.allSettled([...inFlightSpawns]), $.clock.sleep(timeoutMs)])
+        if (!subagentEffortById.has(e.agentId)) {
+          if (!pendingSpawns.has(e.agentId) && startingSpawns.size) {
+            await Promise.race([Promise.allSettled([...startingSpawns]), $.clock.sleep(timeoutMs)])
           }
-          const spawn = subagentEffort.get(e.agentId)
+          const spawn = pendingSpawns.get(e.agentId)
+          // Consume once, including a missing spawn: later steps must be stable.
+          pendingSpawns.delete(e.agentId)
+          subagentEffortById.set(e.agentId, null)
           if (spawn) {
-            const routing = spawn.pinned
-              ? { effort: null, reason: `effort pinned by definition (${spawn.pinned})` }
-              : route(spawn.decision, { model: e.model, effort: e.effort }, subagentEffortPolicy)
-            effort = routing.effort
+            // AgentInfo.effort is assumed to be the definition's pin; a live
+            // session check is still pending.
+            const info = (await $.agent.list()).find((agent) => agent.id === e.agentId) as
+              | ({ effort?: unknown } & { id: string }) | undefined
+            const runtimePinned = typeof info?.effort === 'string' ? info.effort : undefined
+            const routing = subagentEffortRouting(spawn, { model: e.model, effort: e.effort }, subagentEffortPolicy, runtimePinned)
+            const effort = routing.effort
+            const applied = spawn.model || effort
+              ? { ...(spawn.model ? { model: spawn.model } : {}), ...(effort ? { effort } : {}) }
+              : null
+            const reason = spawn.modelReason
+              ? `model: ${spawn.modelReason}; effort: ${routing.reason}` : routing.reason
             record($, decisionLog, {
-              event: 'subagent', agentType: spawn.agentType, ...spawn.decision,
-              from: { model: e.model, effort: e.effort },
-              applied: effort ? { effort } : null, reason: routing.reason,
+              event: 'subagent', agentId: e.agentId, agentType: spawn.agentType, ...spawn.decision,
+              from: { model: e.model, effort: e.effort, source: spawn.source },
+              applied, reason,
             })
             if (logDecisions) $.ui.log(
-              `[jev-model-router] ${spawn.agentType}${effort ? ` → effort ${effort}` : ''}: ${routing.reason}`,
+              `[jev-model-router] ${spawn.agentType}${effort ? ` → effort ${effort}` : ''}: ${reason}`,
             )
-            subagentApplied.set(e.agentId, effort)
-            subagentEffort.delete(e.agentId)
+            subagentEffortById.set(e.agentId, effort)
           }
         }
+        const effort = subagentEffortById.get(e.agentId)
+        if (effort && e.effort !== undefined) request = { ...e, effort }
       } catch (error) {
-        effort = null
+        subagentEffortById.set(e.agentId, null)
         try {
           $.ui.log(`[jev-model-router] subagent effort routing failed: ${String(error)}`)
         } catch {
           // A failed diagnostic must not block the agent's request.
         }
       }
-      return yield* next(effort ? { ...e, effort } : e)
+      return yield* next(request)
     }
     if (!routeMainLoop) return yield* next(e)
 
     // Every request after the first reuses what the turn settled on, so
     // neither the model nor the effort changes under its own tool loop.
     if (e.index > 0 && e.turnId === appliedTurnId) {
-      return yield* next(applied ? { ...e, ...applied } : e)
+      // A later request may have fallen back to a model without effort.
+      const reused = applied && e.effort === undefined ? (applied.model ? { model: applied.model } : null) : applied
+      return yield* next(reused ? { ...e, ...reused } : e)
     }
 
     baseModel ??= await startingModel($, e.model)
@@ -354,7 +372,7 @@ export const register: Register = (on, options) => {
       // A turn left alone is the common case, and it used to be silent, which
       // made a working mod look like one that never loaded. Say what happened.
       if (logDecisions) {
-        const suppressed = held ? ` (${held})` : routing.model && !routeMainModel ? ' (main-loop model routing off)' : ''
+        const suppressed = held ? ` (${held})` : routing.wantedModel && !routeMainModel ? ' (main-loop model routing off)' : ''
         $.ui.log(`[jev-model-router] main loop: ${routing.reason}${suppressed}`)
       }
       return yield* next(e)
@@ -378,12 +396,7 @@ export const register: Register = (on, options) => {
           `[jev-model-router] ${describeSetup(
             active,
             url,
-            {
-              subagentModel: routeSubagentModel,
-              subagentEffort: routeSubagentEffort,
-              mainEffort: routeMainEffort,
-              mainModel: routeMainModel,
-            },
+            switches,
             forced === 'builtin',
           )}`,
         )
@@ -445,9 +458,9 @@ export const register: Register = (on, options) => {
       $.ui.log(`[jev-model-router] jev (${e.subagentType}): ${describeDecision(decision, ms)}`)
     }
 
-    // What the subagent would run on untouched: the model the caller named,
-    // else the one its definition pins, else the parent's. That is what a
-    // change is measured from. Effort pinned by a definition is kept.
+    // The caller's model wins. Without one, the definition may pin a model;
+    // otherwise the agent inherits its parent's model. Keep that origin for
+    // the first-step record even if agent.spawn rewrites the request.
     const definition = e.model && !effortEnabled ? null : await definedAgent($, e.subagentType)
     const defined = definition?.model ?? null
     const current = e.model ?? defined ?? e.parentModel
@@ -461,11 +474,11 @@ export const register: Register = (on, options) => {
         : 'codex flags already in the prompt'
       : (routed?.reason ?? 'no decision')
     const applied = model || codex ? { ...(model ? { model } : {}), ...(codex ? { codex } : {}) } : null
-    if (codexSpawn || model || !effortEnabled) {
+    if (!effortEnabled) {
       record($, decisionLog, { event: 'subagent', agentType: e.subagentType, ...decision, from: { model: current, source }, applied, reason })
     }
     if (!applied) {
-      if (logDecisions && !effortEnabled) $.ui.log(`[jev-model-router] ${e.subagentType}: ${reason}`)
+      if (logDecisions && (!effortEnabled || routed)) $.ui.log(`[jev-model-router] ${e.subagentType}: ${reason}`)
     } else if (logDecisions) {
       $.ui.log(`[jev-model-router] ${e.subagentType} → ${[model, codex && `codex ${codex.model}/${codex.effort}`].filter(Boolean).join(', ')}: ${reason}`)
     }
@@ -476,16 +489,19 @@ export const register: Register = (on, options) => {
     }
     if (!effortEnabled) return next(applied ? changed : e)
     const startedPromise = next(changed).then((started) => {
-      if (started.agentId) subagentEffort.set(started.agentId, {
+      // A timed-out first step has already cached a miss; do not leave a
+      // pending decision that no later step will consume.
+      if (started.agentId && !subagentEffortById.has(started.agentId)) pendingSpawns.set(started.agentId, {
         decision, pinned: definition?.effort ?? null, agentType: e.subagentType,
+        source, model, modelReason: routed ? reason : null,
       })
       return started
     })
-    inFlightSpawns.add(startedPromise)
+    startingSpawns.add(startedPromise)
     try {
       return await startedPromise
     } finally {
-      inFlightSpawns.delete(startedPromise)
+      startingSpawns.delete(startedPromise)
     }
   })
 }
@@ -496,6 +512,14 @@ export const register: Register = (on, options) => {
 // `$.fs` has no append, so writes are chained and the file is rewritten
 // whole; a session is the only writer of its own file.
 type DecisionLog = { enabled: boolean; dir: string; queue: Promise<void>; path?: string }
+type SpawnDecision = {
+  decision: Decision | null
+  pinned: Effort | null
+  agentType: string
+  source: 'call' | 'definition' | 'parent'
+  model: string | null
+  modelReason: string | null
+}
 type Engine = EngineInterface
 
 // An agent type's definition pins these values, or leaves them unset. Answers
