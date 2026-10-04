@@ -44,7 +44,7 @@ export interface Decision {
 /** The reasoning levels a turn can ask for, cheapest first. */
 export const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh'] as const
 
-export type Effort = (typeof EFFORT_ORDER)[number]
+export type Effort = (typeof EFFORT_ORDER)[number] | 'max'
 
 export const TIER_ORDER: readonly Tier[] = ['fast', 'balanced', 'deep']
 
@@ -233,7 +233,7 @@ export function effortLevel(score: number): Effort {
 export function effortRank(effort: string | number | undefined): number | null {
   if (typeof effort !== 'string') return null
   if (effort === 'max') return EFFORT_ORDER.length
-  const index = EFFORT_ORDER.indexOf(effort as Effort)
+  const index = EFFORT_ORDER.indexOf(effort as (typeof EFFORT_ORDER)[number])
   return index === -1 ? null : index
 }
 
@@ -292,6 +292,8 @@ export function requestModelId(model: string): string {
 
 export interface PolicyConfig {
   tiers: Tiers
+  /** Whether the policy may change the request's model. Defaults to true. */
+  routeModel?: boolean
   /**
    * How sure the decision must be to spend more (a bigger model, more
    * reasoning). Being wrong here costs money, so the bar is low.
@@ -401,6 +403,7 @@ export function route(
   const modelBar = config.minModelDowngradeConfidence ?? config.minDowngradeConfidence
 
   const model =
+    config.routeModel !== false &&
     wantedModel &&
     wantedModel !== current.model &&
     (forced || allowed(wantedTier, currentTier, decision.confidence, config, modelBar))
@@ -410,8 +413,8 @@ export function route(
   let effort: Effort | null = null
   if (effortScore !== null) {
     const currentRank = effortRank(current.effort)
-    let wantedRank = EFFORT_ORDER.indexOf(effortLevel(effortScore))
-    const rankOfLevel = (level: Effort | undefined, none: number) => (level ? EFFORT_ORDER.indexOf(level) : none)
+    let wantedRank = EFFORT_ORDER.indexOf(effortLevel(effortScore) as (typeof EFFORT_ORDER)[number])
+    const rankOfLevel = (level: Effort | undefined, none: number) => (level ? effortRank(level) ?? none : none)
     const floorRank = Math.max(
       rankOfLevel(config.effortFloor, 0),
       tier === 'balanced' ? rankOfLevel(config.balancedEffortFloor, 0) : 0,
@@ -511,7 +514,7 @@ function reported(value: number | null): string {
 
 /**
  * The one-time line that says the router is alive, which backend answers it,
- * and which of the three switches are on.
+ * and which routing switches are on.
  *
  * Without this, a router that loaded and a router that never loaded are told
  * apart only by the absence of later lines, which is not evidence of anything.
@@ -519,7 +522,7 @@ function reported(value: number | null): string {
 export function describeSetup(
   provider: Provider | null,
   url: string,
-  switches: { subagentModel: boolean; mainEffort: boolean; mainModel: boolean },
+  switches: { subagentModel: boolean; subagentEffort: boolean; mainEffort: boolean; mainModel: boolean },
   // `provider: "builtin"` is a choice, not a missing key. Reporting it as a
   // credential problem sends someone hunting for a key they meant to omit.
   builtinByChoice = false,
@@ -531,6 +534,7 @@ export function describeSetup(
       : 'the built-in classifier, no key set'
   const on = [
     switches.subagentModel && 'subagent model',
+    switches.subagentEffort && 'subagent effort',
     switches.mainEffort && 'main effort',
     switches.mainModel && 'main model',
   ].filter(Boolean)
@@ -583,6 +587,12 @@ export function describeStatus(
 export function definitionModel(markdown: string): string | null {
   const value = frontmatterField(markdown, 'model')
   return value && value !== 'inherit' ? value : null
+}
+
+/** An agent definition's pinned reasoning effort, if it names a supported level. */
+export function definitionEffort(markdown: string): Effort | null {
+  const value = frontmatterField(markdown, 'effort')
+  return value && effortRank(value) !== null ? (value as Effort) : null
 }
 
 /** One scalar field of a Markdown file's YAML frontmatter, unquoted; null when absent. */

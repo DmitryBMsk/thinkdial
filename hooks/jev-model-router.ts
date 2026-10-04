@@ -11,8 +11,9 @@
  * neither, the engine's own `$.model.classify` stands in, so the mod is
  * useful without any account.
  *
- * Three things it can set, each on its own switch:
+ * Four things it can set, each on its own switch:
  *   agent.spawn  — the model of each subagent (on by default)
+ *   turn.step    — the reasoning effort of each Claude subagent (on by default)
  *   turn.step    — the reasoning effort of the main loop (on by default)
  *   turn.step    — the model of the main loop (off by default: switching
  *                  models mid-session invalidates the prompt cache, which can
@@ -23,8 +24,7 @@
  * mistakes do not cost the same, so they do not clear the same confidence bar
  * (see `minUpgradeConfidence` / `minDowngradeConfidence` in policy.ts).
  *
- * The Agent tool has no effort parameter, so a subagent's effort is not ours
- * to set; only its model is.
+ * The Agent tool has no effort parameter; a subagent's first turn.step sets it.
  *
  * The prompt is classified at `prompt.submit`, which runs before the turn
  * starts, and the decision is applied at the turn's first request.
@@ -48,6 +48,7 @@ import {
   definitionDirs,
   definitionMatches,
   definitionModel,
+  definitionEffort,
   pluginAgentDirs,
   describeDecision,
   describeSetup,
@@ -105,6 +106,7 @@ export const register: Register = (on, options) => {
 
   const timeoutMs = number('timeoutMs', 800)
   const routeSubagentModel = flag('routeSubagentModel', true)
+  const routeSubagentEffort = flag('routeSubagentEffort', true)
   // A spawn of the Codex rescue agent gets `--model` / `--effort` for Codex
   // itself from the same decision; the agent forwards them. Its own model is
   // left alone: it only relays, so a bigger one would be money for nothing.
@@ -153,12 +155,17 @@ export const register: Register = (on, options) => {
   }
   const mainPolicy: PolicyConfig = {
     ...policy,
+    routeModel: routeMainModel,
     modelFloor: (TIER_ORDER as readonly string[]).includes(mainFloor) ? (mainFloor as Tier) : undefined,
     minModelDowngradeConfidence: number('mainMinModelDowngradeConfidence', 0.9),
     effortFloor: effortOption('mainEffortFloor'),
     balancedEffortFloor: effortOption('mainBalancedEffortFloor'),
     effortCeiling: effortOption('mainEffortCeiling'),
   }
+  const subagentEffortPolicy: PolicyConfig = { ...mainPolicy, routeModel: false }
+  const subagentEffort = new Map<string, { decision: Decision | null; pinned: Effort | null; agentType: string }>()
+  const subagentApplied = new Map<string, Effort | null>()
+  const inFlightSpawns = new Set<Promise<unknown>>()
 
   // The classification waiting for the turn that reads its prompt, and what
   // the current turn settled on. Both are single slots: main-loop turns run
@@ -190,6 +197,7 @@ export const register: Register = (on, options) => {
             url,
             {
               subagentModel: routeSubagentModel,
+              subagentEffort: routeSubagentEffort,
               mainEffort: routeMainEffort,
               mainModel: routeMainModel,
             },
@@ -263,7 +271,45 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.step', async function* ($, e, next) {
-    if (!routeMainLoop || e.agentId) return yield* next(e)
+    if (e.agentId) {
+      if (!routeSubagentEffort) return yield* next(e)
+      let effort: Effort | null = null
+      try {
+        if (subagentApplied.has(e.agentId)) {
+          effort = subagentApplied.get(e.agentId) ?? null
+        } else {
+          if (!subagentEffort.has(e.agentId) && inFlightSpawns.size) {
+            await Promise.race([Promise.allSettled([...inFlightSpawns]), $.clock.sleep(timeoutMs)])
+          }
+          const spawn = subagentEffort.get(e.agentId)
+          if (spawn) {
+            const routing = spawn.pinned
+              ? { effort: null, reason: `effort pinned by definition (${spawn.pinned})` }
+              : route(spawn.decision, { model: e.model, effort: e.effort }, subagentEffortPolicy)
+            effort = routing.effort
+            record($, decisionLog, {
+              event: 'subagent', agentType: spawn.agentType, ...spawn.decision,
+              from: { model: e.model, effort: e.effort },
+              applied: effort ? { effort } : null, reason: routing.reason,
+            })
+            if (logDecisions) $.ui.log(
+              `[jev-model-router] ${spawn.agentType}${effort ? ` → effort ${effort}` : ''}: ${routing.reason}`,
+            )
+            subagentApplied.set(e.agentId, effort)
+            subagentEffort.delete(e.agentId)
+          }
+        }
+      } catch (error) {
+        effort = null
+        try {
+          $.ui.log(`[jev-model-router] subagent effort routing failed: ${String(error)}`)
+        } catch {
+          // A failed diagnostic must not block the agent's request.
+        }
+      }
+      return yield* next(effort ? { ...e, effort } : e)
+    }
+    if (!routeMainLoop) return yield* next(e)
 
     // Every request after the first reuses what the turn settled on, so
     // neither the model nor the effort changes under its own tool loop.
@@ -334,6 +380,7 @@ export const register: Register = (on, options) => {
             url,
             {
               subagentModel: routeSubagentModel,
+              subagentEffort: routeSubagentEffort,
               mainEffort: routeMainEffort,
               mainModel: routeMainModel,
             },
@@ -344,8 +391,10 @@ export const register: Register = (on, options) => {
     }
 
     // A fork inherits its parent's model; `model` is ignored for it.
-    const codexSpawn = routeCodexDelegation && codexAgentTypes.includes(e.subagentType)
-    if ((!routeSubagentModel && !codexSpawn) || e.fork) return next(e)
+    const codexType = codexAgentTypes.includes(e.subagentType)
+    const codexSpawn = routeCodexDelegation && codexType
+    const effortEnabled = routeSubagentEffort && !codexType
+    if ((!routeSubagentModel && !effortEnabled && !codexSpawn) || e.fork) return next(e)
 
     if (!unusableReported) {
       unusableReported = true
@@ -398,9 +447,9 @@ export const register: Register = (on, options) => {
 
     // What the subagent would run on untouched: the model the caller named,
     // else the one its definition pins, else the parent's. That is what a
-    // change is measured from. The Agent tool takes no effort, so only the
-    // model is ours to set here.
-    const defined = e.model ? null : await definedModel($, e.subagentType)
+    // change is measured from. Effort pinned by a definition is kept.
+    const definition = e.model && !effortEnabled ? null : await definedAgent($, e.subagentType)
+    const defined = definition?.model ?? null
     const current = e.model ?? defined ?? e.parentModel
     const source = e.model ? 'call' : defined ? 'definition' : 'parent'
     const routed = codexSpawn || !routeSubagentModel ? null : route(decision, { model: current }, policy)
@@ -412,17 +461,32 @@ export const register: Register = (on, options) => {
         : 'codex flags already in the prompt'
       : (routed?.reason ?? 'no decision')
     const applied = model || codex ? { ...(model ? { model } : {}), ...(codex ? { codex } : {}) } : null
-    record($, decisionLog, { event: 'subagent', agentType: e.subagentType, ...decision, from: { model: current, source }, applied, reason })
-    if (!applied) {
-      if (logDecisions) $.ui.log(`[jev-model-router] ${e.subagentType}: ${reason}`)
-      return next(e)
+    if (codexSpawn || model || !effortEnabled) {
+      record($, decisionLog, { event: 'subagent', agentType: e.subagentType, ...decision, from: { model: current, source }, applied, reason })
     }
-    if (logDecisions) $.ui.log(`[jev-model-router] ${e.subagentType} → ${[model, codex && `codex ${codex.model}/${codex.effort}`].filter(Boolean).join(', ')}: ${reason}`)
-    return next({
+    if (!applied) {
+      if (logDecisions && !effortEnabled) $.ui.log(`[jev-model-router] ${e.subagentType}: ${reason}`)
+    } else if (logDecisions) {
+      $.ui.log(`[jev-model-router] ${e.subagentType} → ${[model, codex && `codex ${codex.model}/${codex.effort}`].filter(Boolean).join(', ')}: ${reason}`)
+    }
+    const changed = {
       ...e,
       ...(model ? { model } : {}),
       ...(codex ? { prompt: `--model ${codex.model} --effort ${codex.effort} ${e.prompt}` } : {}),
+    }
+    if (!effortEnabled) return next(applied ? changed : e)
+    const startedPromise = next(changed).then((started) => {
+      if (started.agentId) subagentEffort.set(started.agentId, {
+        decision, pinned: definition?.effort ?? null, agentType: e.subagentType,
+      })
+      return started
     })
+    inFlightSpawns.add(startedPromise)
+    try {
+      return await startedPromise
+    } finally {
+      inFlightSpawns.delete(startedPromise)
+    }
   })
 }
 
@@ -434,19 +498,17 @@ export const register: Register = (on, options) => {
 type DecisionLog = { enabled: boolean; dir: string; queue: Promise<void>; path?: string }
 type Engine = EngineInterface
 
-// The model an agent type's definition pins, or null for none, inherit, a
-// built-in type, a definition not found or any failure: a miss falls back to
-// the parent's model, which is what the router measured from before it read
-// definitions. Answers are cached for a minute per type, so a burst of
-// spawns (built-ins included, which never match) scans the folders once.
+// An agent type's definition pins these values, or leaves them unset. Answers
+// are cached for a minute per type, so a burst of spawns scans folders once.
 const DEFINITION_TTL_MS = 60_000
-const definitionCache = new Map<string, { model: string | null; at: number }>()
+type AgentDefinition = { model: string | null; effort: Effort | null }
+const definitionCache = new Map<string, AgentDefinition & { at: number }>()
 
-async function definedModel($: Engine, subagentType: string): Promise<string | null> {
+async function definedAgent($: Engine, subagentType: string): Promise<AgentDefinition> {
   const now = await $.clock.now()
   const cached = definitionCache.get(subagentType)
-  if (cached && now - cached.at < DEFINITION_TTL_MS) return cached.model
-  let model: string | null = null
+  if (cached && now - cached.at < DEFINITION_TTL_MS) return cached
+  const definition: AgentDefinition = { model: null, effort: null }
   try {
     const home = (await $.env.get('HOME')) ?? ''
     const pluginDirs: string[] = []
@@ -477,15 +539,16 @@ async function definedModel($: Engine, subagentType: string): Promise<string | n
     for (const dir of dirs) {
       const found = await findDefinition($, dir, agent, budget)
       if (found !== undefined) {
-        model = definitionModel(found)
+        definition.model = definitionModel(found)
+        definition.effort = definitionEffort(found)
         break
       }
     }
   } catch (error) {
     $.ui.log(`[jev-model-router] reading the ${subagentType} definition failed: ${String(error)}`)
   }
-  definitionCache.set(subagentType, { model, at: now })
-  return model
+  definitionCache.set(subagentType, { ...definition, at: now })
+  return definition
 }
 
 // The text of the definition in `dir` (or up to two folders below it) that

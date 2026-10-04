@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import {
   codexFlags,
   definitionModel,
+  definitionEffort,
   gateMainModel,
   definitionDirs,
   definitionMatches,
@@ -338,17 +339,18 @@ test('the setup line names the backend and which switches are on', () => {
   expect(
     describeSetup('typesafe', 'https://api.typesafe.ai/v1/systemone', {
       subagentModel: true,
+      subagentEffort: true,
       mainEffort: true,
       mainModel: false,
     }),
   ).toBe(
-    'ready on typesafe (https://api.typesafe.ai/v1/systemone); routing subagent model, main effort',
+    'ready on typesafe (https://api.typesafe.ai/v1/systemone); routing subagent model, subagent effort, main effort',
   )
 })
 
 test('the setup line says so when there is no backend and when nothing routes', () => {
   expect(
-    describeSetup(null, '', { subagentModel: false, mainEffort: false, mainModel: false }),
+    describeSetup(null, '', { subagentModel: false, subagentEffort: false, mainEffort: false, mainModel: false }),
   ).toBe('ready on the built-in classifier, no key set; routing nothing, every switch is off')
 })
 
@@ -356,8 +358,8 @@ test('the setup line says so when there is no backend and when nothing routes', 
 // sends someone looking for a credential they meant to leave out.
 test('choosing the built-in classifier is not reported as a missing key', () => {
   expect(
-    describeSetup(null, '', { subagentModel: true, mainEffort: true, mainModel: false }, true),
-  ).toBe('ready on the built-in classifier, by choice; routing subagent model, main effort')
+    describeSetup(null, '', { subagentModel: true, subagentEffort: true, mainEffort: true, mainModel: false }, true),
+  ).toBe('ready on the built-in classifier, by choice; routing subagent model, subagent effort, main effort')
 })
 
 test('the decision line carries every answer and the latency', () => {
@@ -580,4 +582,31 @@ test('the ceiling holds sonnet at high, whatever it was on', () => {
 test('the ceiling does not apply once the loop is on the deep tier', () => {
   expect(route(deep(3), on('claude-opus-5-5', 'high'), graded).effort).toBe('xhigh')
   expect(route(deep(3), on('claude-opus-5-5', 'xhigh'), graded).effort).toBeNull()
+})
+
+test('effort-only routing uses the model actually running for its ceiling', () => {
+  const effortOnly = { ...graded, routeModel: false }
+  const sonnet = route(deep(3), on('claude-sonnet-5-5', 'medium'), effortOnly)
+  expect(sonnet.model).toBeNull()
+  expect(sonnet.effort).toBe('high')
+  expect(sonnet.reason).toBe('deep (confidence 0.90)')
+  expect(route(deep(3), on('claude-opus-5-5', 'medium'), effortOnly).effort).toBe('xhigh')
+  expect(route(deep(3), on('claude-sonnet-5-5', 'medium'), graded).model).toBe('opus')
+})
+
+test('risk raises effort without changing the model when model routing is off', () => {
+  const risky: Decision = { ...mechanical(0.01), risky: 0.9, effort: 0, effortConfidence: 0.01 }
+  const result = route(risky, on('claude-sonnet-5-5', 'low'), { ...graded, routeModel: false })
+  expect(result.model).toBeNull()
+  expect(result.effort).toBe('high')
+  expect(result.forced).toBe(true)
+})
+
+test('definition effort accepts only supported frontmatter values', () => {
+  expect(definitionEffort('---\neffort: high\n---\n')).toBe('high')
+  expect(definitionEffort('---\neffort: "xhigh"\n---\n')).toBe('xhigh')
+  expect(definitionEffort('---\neffort: max\n---\n')).toBe('max')
+  expect(definitionEffort('---\nname: reviewer\n---\n')).toBeNull()
+  expect(definitionEffort('---\neffort: 1000\n---\n')).toBeNull()
+  expect(definitionEffort('---\neffort: lots\n---\n')).toBeNull()
 })

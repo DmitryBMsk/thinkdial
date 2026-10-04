@@ -11,23 +11,26 @@ Two backends, chosen by whichever key is set:
 
 TypeSafe's own API wins when both keys are set: it is the only one that reports a calibrated confidence, which is what the confidence bars below read. Set `provider` to force one, or to `builtin` to use neither. Each backend keeps its own URL and model option, so an override written for one is never sent to the other. A `provider` forced onto a backend whose key is missing degrades to the built-in classifier and says so once in the log.
 
-Three switches, and they are not equally safe:
+Four switches, with different costs:
 
 | Switch | What it sets | Default |
 |---|---|---|
 | `routeSubagentModel` | the model of each subagent, at `agent.spawn` | on |
+| `routeSubagentEffort` | the effort of each Claude subagent, at its first `turn.step` | on |
 | `routeMainEffort` | the reasoning effort of the main conversation, at `turn.step` | on |
 | `routeMainModel` | the model of the main conversation, at `turn.step` | **off** |
 
 A subagent starts with its own context, so routing its model costs nothing beyond the classification. Changing the main loop's *model* mid-session is the expensive one: it invalidates the prompt cache, and on a long context re-caching can cost more than the cheaper tier saves. Turn it on once you have measured your own sessions, not before.
 
-The Agent tool has no effort parameter, so a subagent's effort is not this mod's to set.
-
 A main-loop model switch forfeits the prompt cache: the new model writes the whole conversation to its own cache before it answers. So `routeMainModel` switches freely only while the context is at most `mainModelMaxContextTokens`. Above it, the only switch allowed is back to the session's starting model, recorded per session in the plugin store, so a session that dropped to a small model early is not stuck there for a hard turn later. A model in the starting model's family is always sent as the starting id, so a `[1m]` session keeps its window. A held switch is logged with `held model: context N > limit` in the decision reason.
 
 A subagent's routing is measured from the model it would run on untouched: the Agent tool's `model` if the caller passed one, else the `model` in its definition's frontmatter (the project's `.claude/agents/<type>.md`, then `~/.claude/agents/<type>.md`, then `agents/<agent>.md` in each install of the plugin for a `plugin:agent` type), else the parent's. `inherit` or no `model` line means the parent's. The decision log records which one as `from.source`: `call`, `definition` or `parent`.
 
-**Both directions, both dimensions.** A task read as mechanical is routed down; one read as hard is routed up — model and effort alike.
+## Subagent effort
+
+The Agent tool has no effort parameter. The router classifies a Claude subagent at `agent.spawn`, then applies its effort at that subagent's first `turn.step`. The choice is reused for later steps and turns of the same agent. An `effort:` value in the agent definition keeps that agent's own setting. Forks, Codex delegations, and agents without a matching spawn are left alone. The same effort floors and ceiling used for the main loop apply, based on the subagent's actual model.
+
+**Both directions, both dimensions.** A task read as mechanical is routed down; one read as hard is routed up for the routing switches that are enabled.
 
 The prompt is classified at `prompt.submit`, which runs before the turn starts, and the decision is applied to the turn's first model request and reused by the rest of that turn.
 
@@ -139,6 +142,7 @@ With a key set, the prompt text leaves the machine and goes to whichever backend
   minUpgradeConfidence:   number  bar to spend more (default 0.3)
   minDowngradeConfidence: number  bar to spend less (default 0.6)
   routeSubagentModel:     boolean model of each subagent (default true)
+  routeSubagentEffort:    boolean effort of each Claude subagent (default true)
   routeCodexDelegation:   boolean give codex:codex-rescue spawns --model/--effort for Codex from the same decision (default true)
   codexAgentTypes:        string comma-separated agent types treated as Codex delegation (default codex:codex-rescue)
   codexFastModel / codexBalancedModel / codexDeepModel: Codex ladder (default gpt-6-luna / gpt-6-sol / gpt-6-sol: sol carries hard work, effort carries difficulty; no decision → sol/low)
