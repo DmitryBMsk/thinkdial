@@ -267,6 +267,19 @@ export function effortForModel(effort: Effort | undefined, model: string, config
   return effort
 }
 
+/** Reuse a turn's choice against the model the next step will actually send. */
+export function reuseForStep(
+  applied: { model?: string; effort?: Effort } | null,
+  step: { model: string; effort?: string | number },
+  config: PolicyConfig,
+): { model?: string; effort?: Effort } | null {
+  if (!applied) return null
+  const reused = step.effort === undefined ? (applied.model ? { model: applied.model } : null) : applied
+  if (!reused) return null
+  const effort = reused.effort ? effortForModel(reused.effort, reused.model ?? step.model, config) : null
+  return effort ? { ...reused, effort } : reused
+}
+
 /**
  * The full id a family alias names on the main loop.
  *
@@ -475,17 +488,23 @@ export function route(
   return { model, wantedModel, effort, reason: forced ? (config.routeModel === false ? 'effort forced by risk' : `${label}, forced by risk`) : `${label} (${said})`, forced }
 }
 
-/** One Claude subagent's effort decision, including definition pins. */
+/** Match model ids despite a context-window suffix such as `[1m]`. */
+export function sameModel(model: string, sessionModel?: string): boolean {
+  return sessionModel !== undefined && model.replace(/\[[^\]]+\]$/, '').toLowerCase() === sessionModel.replace(/\[[^\]]+\]$/, '').toLowerCase()
+}
+
+/** One Claude subagent's effort decision, including detectable definition pins. */
 export function subagentEffortRouting(
   spawn: { decision: Decision | null; pinned: Effort | null },
   current: { model: string; effort?: string | number },
   config: PolicyConfig,
-  sessionEffort?: string | number,
+  session?: { model?: string; effort?: string | number },
 ): Pick<Routing, 'effort' | 'reason'> {
   if (spawn.pinned) return { effort: null, reason: `effort pinned by definition (${spawn.pinned})` }
-  // A definition pinned to the session's level cannot be distinguished here.
-  if (current.effort !== undefined && sessionEffort !== undefined && current.effort !== sessionEffort) {
-    return { effort: null, reason: `effort set by agent definition (${current.effort}, session ${sessionEffort})` }
+  // A same-model pin equal to the session level is indistinguishable; pins on
+  // other models from --agents or AgentSpec are not detected by this heuristic.
+  if (sameModel(current.model, session?.model) && current.effort !== undefined && session?.effort !== undefined && current.effort !== session.effort) {
+    return { effort: null, reason: `effort set by agent definition (${current.effort}, session ${session.effort})` }
   }
   if (current.effort === undefined) return { effort: null, reason: 'model takes no effort' }
   const { effort, reason } = route(spawn.decision, current, { ...config, routeModel: false })

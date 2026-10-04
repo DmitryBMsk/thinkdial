@@ -21,7 +21,9 @@ import {
   requestBody,
   requestHeaders,
   requestModelId,
+  reuseForStep,
   route,
+  sameModel,
   subagentEffortRouting,
   selectProvider,
   bareCommand,
@@ -630,14 +632,38 @@ test('definition effort accepts only supported frontmatter values', () => {
 
 test('a subagent effort different from the session is treated as a definition pin', () => {
   const spawn = { decision: deep(3), pinned: null }
-  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'high'), graded, 'medium')).toEqual({
+  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'high'), graded, { model: 'claude-opus-5-5', effort: 'medium' })).toEqual({
     effort: null, reason: 'effort set by agent definition (high, session medium)',
   })
 })
 
+test('a different-model subagent can use its own default effort', () => {
+  const spawn = { decision: deep(3), pinned: null }
+  expect(subagentEffortRouting(
+    spawn, on('claude-opus-5-5', 'high'), graded,
+    { model: 'claude-sonnet-5-5', effort: 'medium' },
+  ).effort).toBe('xhigh')
+})
+
+test('the runtime pin heuristic matches model ids across case and context suffixes', () => {
+  const spawn = { decision: deep(3), pinned: null }
+  expect(sameModel('CLAUDE-OPUS-5-5[1m]', 'claude-opus-5-5')).toBe(true)
+  expect(sameModel('claude-opus-5-5', 'CLAUDE-OPUS-5-5[1m]')).toBe(true)
+  expect(sameModel('claude-opus-5-5', undefined)).toBe(false)
+  expect(subagentEffortRouting(
+    spawn, on('claude-opus-5-5[1m]', 'high'), graded,
+    { model: 'claude-opus-5-5', effort: 'medium' },
+  ).effort).toBeNull()
+})
+
+test('an unknown session model gives no runtime pin evidence', () => {
+  const spawn = { decision: deep(3), pinned: null }
+  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'high'), graded, { effort: 'medium' }).effort).toBe('xhigh')
+})
+
 test('an equal or unknown session effort does not imply a definition pin', () => {
   const spawn = { decision: deep(3), pinned: null }
-  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'medium'), graded, 'medium').effort).toBe('xhigh')
+  expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'medium'), graded, { model: 'claude-opus-5-5', effort: 'medium' }).effort).toBe('xhigh')
   expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'medium'), graded).effort).toBe('xhigh')
 })
 
@@ -646,6 +672,14 @@ test('a file pin wins even when session effort is unknown', () => {
   expect(subagentEffortRouting(spawn, on('claude-opus-5-5', 'high'), graded)).toEqual({
     effort: null, reason: 'effort pinned by definition (high)',
   })
+})
+
+test('a file pin wins even when the models differ', () => {
+  const spawn = { decision: deep(3), pinned: 'high' as const }
+  expect(subagentEffortRouting(
+    spawn, on('claude-opus-5-5', 'high'), graded,
+    { model: 'claude-sonnet-5-5', effort: 'medium' },
+  ).reason).toBe('effort pinned by definition (high)')
 })
 
 test('cached effort is capped when a later request falls back to a balanced or unknown model', () => {
@@ -657,6 +691,24 @@ test('cached effort remains on deep models and without a configured ceiling', ()
   expect(effortForModel('xhigh', 'claude-opus-5-5', graded)).toBe('xhigh')
   expect(effortForModel('xhigh', 'claude-sonnet-5-5', config)).toBe('xhigh')
   expect(effortForModel(undefined, 'claude-sonnet-5-5', graded)).toBeNull()
+})
+
+test('a reused model override sets the effort ceiling for later steps', () => {
+  expect(reuseForStep(
+    { model: 'claude-opus-5-5', effort: 'xhigh' },
+    on('claude-sonnet-5-5', 'medium'),
+    graded,
+  )).toEqual({ model: 'claude-opus-5-5', effort: 'xhigh' })
+})
+
+test('a reused effort without a model override is capped against the step model', () => {
+  expect(reuseForStep({ effort: 'xhigh' }, on('claude-sonnet-5-5', 'medium'), graded)).toEqual({ effort: 'high' })
+})
+
+test('a later step without effort keeps only the reused model', () => {
+  expect(reuseForStep(
+    { model: 'claude-opus-5-5', effort: 'xhigh' }, on('claude-sonnet-5-5'), graded,
+  )).toEqual({ model: 'claude-opus-5-5' })
 })
 
 test('a file definition pin keeps the subagent effort', () => {

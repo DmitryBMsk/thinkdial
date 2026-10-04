@@ -58,6 +58,7 @@ import {
   rankOf,
   endpoint,
   effortForModel,
+  reuseForStep,
   pendingDecisions,
   readDecision,
   selectProvider,
@@ -177,6 +178,7 @@ export const register: Register = (on, options) => {
   // Null also records a miss, so unknown agents never wait a second time.
   const subagentEffortById = new Map<string, Effort | null>()
   let sessionEffort: string | number | undefined
+  let sessionModel: string | undefined
   // A first step can overtake the agent.spawn continuation that gives us its id.
   const startingSpawns = new Set<Promise<unknown>>()
 
@@ -292,7 +294,7 @@ export const register: Register = (on, options) => {
           pendingSpawns.delete(e.agentId)
           subagentEffortById.set(e.agentId, null)
           if (spawn) {
-            const routing = subagentEffortRouting(spawn, { model: e.model, effort: e.effort }, subagentEffortPolicy, sessionEffort)
+            const routing = subagentEffortRouting(spawn, { model: e.model, effort: e.effort }, subagentEffortPolicy, { model: sessionModel, effort: sessionEffort })
             const effort = routing.effort
             const applied = spawn.model || effort
               ? { ...(spawn.model ? { model: spawn.model } : {}), ...(effort ? { effort } : {}) }
@@ -323,16 +325,18 @@ export const register: Register = (on, options) => {
       }
       return yield* next(request)
     }
-    if (e.index === 0) sessionEffort = e.effort
+    if (e.index === 0) {
+      sessionEffort = e.effort
+      sessionModel = e.model
+    }
     if (!routeMainLoop) return yield* next(e)
 
     // Every request after the first reuses what the turn settled on, so
     // neither the model nor the effort changes under its own tool loop.
     if (e.index > 0 && e.turnId === appliedTurnId) {
       // A later request may have fallen back to a model without effort.
-      const reused = applied && e.effort === undefined ? (applied.model ? { model: applied.model } : null) : applied
-      const capped = reused?.effort ? effortForModel(reused.effort, e.model, mainPolicy) : null
-      return yield* next(reused ? { ...e, ...reused, ...(capped ? { effort: capped } : {}) } : e)
+      const reused = reuseForStep(applied, e, mainPolicy)
+      return yield* next(reused ? { ...e, ...reused } : e)
     }
 
     baseModel ??= await startingModel($, e.model)
