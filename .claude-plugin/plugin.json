@@ -3,10 +3,10 @@
   "version": "0.5.3",
   "description": "Picks the model and reasoning effort for each task with TypeSafe's Jev. Routes subagent models at agent.spawn and subagent and main-loop effort at turn.step, with optional main-loop model routing. Falls back to the engine's built-in classifier when no key is set.",
   "author": {
-    "name": "claude-code-templates",
-    "url": "https://www.aitmpl.com"
+    "name": "Dmitrii Bakhtin",
+    "url": "https://github.com/DmitryBMsk"
   },
-  "repository": "https://github.com/davila7/claude-code-templates",
+  "repository": "https://github.com/DmitryBMsk/jev-router",
   "license": "MIT",
   "keywords": [
     "mod",
@@ -131,5 +131,6 @@
       "description": "Write each routing decision to the session log",
       "default": true
     }
-  }
+  },
+  "homepage": "https://github.com/DmitryBMsk/jev-router#readme"
 }

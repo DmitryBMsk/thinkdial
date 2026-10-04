@@ -1,212 +1,326 @@
-# jev-model-router
+<div align="center">
 
-Picks the model and the reasoning effort each task runs with, using [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), TypeSafe's System One decision model: unstructured state in, a typed choice with a probability distribution out, no free-form text.
+# jev-router
 
-Two backends, chosen by whichever key is set:
+**Reasoning-effort calibration for Claude Code, decided per task by a typed decision model.**
 
-| Backend | Endpoint | Model | Confidence |
-|---|---|---|---|
-| `typesafe` | `POST api.typesafe.ai/v1/systemone` | `jev-latest` | reported per answer |
-| `gateway` | `POST ai-gateway.vercel.sh/v4/ai/evaluation-model` | `typesafe-ai/jev` | derived from an optional distribution |
+[![tests](https://github.com/DmitryBMsk/jev-router/actions/workflows/test.yml/badge.svg)](https://github.com/DmitryBMsk/jev-router/actions/workflows/test.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-2.1.259%2B-d97757)](https://github.com/anthropics/claude-code/tree/main/mods)
+[![runtime: bun](https://img.shields.io/badge/tests-bun-f9f1e1)](https://bun.sh)
 
-TypeSafe's own API wins when both keys are set: it is the only one that reports a calibrated confidence, which is what the confidence bars below read. Set `provider` to force one, or to `builtin` to use neither. Each backend keeps its own URL and model option, so an override written for one is never sent to the other. A `provider` forced onto a backend whose key is missing degrades to the built-in classifier and says so once in the log.
+</div>
 
-Four switches, with different costs:
+`jev-router` is a Claude Code **mod** (a plugin of function hooks). Before each turn it asks [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), TypeSafe's System One decision model, three typed questions about the task: how hard is it, how much reasoning does it need, and is it risky. It then sets the **reasoning effort** of the request:
 
-| Switch | What it sets | Default |
-|---|---|---|
-| `routeSubagentModel` | the model of each subagent, at `agent.spawn` | on |
-| `routeSubagentEffort` | the effort of each Claude subagent, at its first `turn.step` | on |
-| `routeMainEffort` | the reasoning effort of the main conversation, at `turn.step` | on |
-| `routeMainModel` | the model of the main conversation, at `turn.step` | **off** |
+- of the **main conversation**,
+- of every **Claude subagent** the Agent tool starts,
+- of every **Codex delegation** (`codex:codex-rescue`), as `--effort`.
 
-A subagent starts with its own context, so routing its model costs nothing beyond the classification. Changing the main loop's *model* mid-session is the expensive one: it invalidates the prompt cache, and on a long context re-caching can cost more than the cheaper tier saves. Turn it on once you have measured your own sessions, not before.
+It does not change which model answers, unless you turn that on (see [why not](#why-effort-only)). Every failure path is fail-open: if the classification is slow, errors out or makes no sense, the request goes out exactly as Claude Code built it.
 
-A main-loop model switch forfeits the prompt cache: the new model writes the whole conversation to its own cache before it answers. So `routeMainModel` switches freely only while the context is at most `mainModelMaxContextTokens`. Above it, the only switch allowed is back to the session's starting model, recorded per session in the plugin store, so a session that dropped to a small model early is not stuck there for a hard turn later. A model in the starting model's family is always sent as the starting id, so a `[1m]` session keeps its window. A held switch is logged with `held model: context N > limit` in the decision reason.
+> The plugin id is still `jev-model-router` (that is what Claude Code and your `pluginConfigs` know it by). The repository is `jev-router`.
 
-A subagent's routing is measured from the model it would run on untouched: the Agent tool's `model` if the caller passed one, else the `model` in its definition's frontmatter (the project's `.claude/agents/<type>.md`, then `~/.claude/agents/<type>.md`, then `agents/<agent>.md` in each install of the plugin for a `plugin:agent` type), else the parent's. `inherit` or no `model` line means the parent's. The decision log records which one as `from.source`: `call`, `definition` or `parent`.
+---
 
-## Subagent effort
+## Contents
 
-The Agent tool has no effort parameter. The router classifies a Claude subagent at `agent.spawn`, then applies its effort at that subagent's first `turn.step`. The choice is reused for later steps and turns of the same agent. An `effort:` value found in the agent's file definition keeps that setting. When a subagent runs on the session's model, the router also keeps its effort if its first request differs from the session effort. A definition pinned to the same level as the session cannot be detected this way and may be routed. Pins on a different model supplied through `--agents` or AgentSpec are not detected by this heuristic. A model whose request has no effort setting receives no effort override. Forks, Codex delegations, and agents without a matching spawn are left alone. The effort ceiling is checked against the model sent on every request, including after a fallback.
+- [Why effort-only](#why-effort-only)
+- [How it works](#how-it-works)
+- [Quick start](#quick-start)
+- [How it decides](#how-it-decides)
+- [Subagents](#subagents)
+- [Codex delegations](#codex-delegations)
+- [Seeing what it did](#seeing-what-it-did)
+- [Options](#options)
+- [Troubleshooting](#troubleshooting)
+- [Privacy and failure modes](#privacy-and-failure-modes)
+- [Development](#development)
+- [Credits and license](#credits-and-license)
 
-**Both directions, both dimensions.** A task read as mechanical is routed down; one read as hard is routed up for the routing switches that are enabled.
+---
 
-The prompt is classified at `prompt.submit`, which runs before the turn starts, and the decision is applied to the turn's first model request and reused by the rest of that turn.
+## Why effort-only
 
-**With no key configured the mod still works**: it falls back to the engine's own `$.model.classify`, which answers the same question with the small fast model. That path reports no confidence, so the threshold does not apply to it.
+The router started by routing **models** as well: haiku for mechanical turns, opus for hard ones. One user's week of real sessions, 1,174 routed main-loop turns across 133 sessions in late September 2026, showed why that loses money in a long Claude Code session:
 
-## What it asks
+| What changed at the start of a turn | Turns | Prompt-cache miss |
+|---|---:|---:|
+| nothing | 433 | **1 %** |
+| effort only | 495 | **1 %** |
+| model | 16 | **81 %** |
+| model + effort | 20 | **70 %** |
 
-One request, three questions evaluated in parallel:
+- **The prompt cache belongs to each model.** A new model writes the whole conversation into its own cache before it answers, and in a long session that write is most of the request.
+- **Cheaper models do not read the cache for less.** Claude Opus 5.5 and Claude Sonnet 5.5 charge the same $0.20 per million cached input tokens, and cache reads were about half of the spend. Moving from opus to sonnet mid-session saved almost nothing and paid for a full cache rewrite.
+- **Effort is free to move.** Changing effort between turns did not invalidate the cache at all (1 % misses, the same as changing nothing). So effort is the dimension worth routing.
 
-- `tier` — a `choice` between three descriptions of the *work* (mechanical and local / ordinary engineering / hard or high-stakes). The decision model never sees a model name.
-- `effort` — a `score` on a four-level rubric, for how much step-by-step reasoning the task needs.
-- `risky` — whether the task touches production, money, credentials, or state that cannot be undone. A `noul` on TypeSafe's API, a `boolean` on the Gateway: the same question under two names.
+Model routing is still in the code, behind `routeMainModel` and `routeSubagentModel`, for anyone whose sessions look different. Measure your own before you turn it on: the decision log below has everything you need.
+
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph Main["Main conversation"]
+    A[prompt.submit] -->|prompt text| J1{{Jev}}
+    J1 -->|tier · effort · risky| P1[policy]
+    P1 --> T1["turn.step<br/>effort for this turn"]
+  end
+  subgraph Sub["Claude subagent"]
+    S[agent.spawn] -->|prompt · description · type| J2{{Jev}}
+    J2 --> K[(decision by agentId)]
+    K --> T2["subagent's turn.step<br/>effort for every request"]
+  end
+  subgraph Codex["Codex delegation"]
+    C[agent.spawn<br/>codex:codex-rescue] --> J3{{Jev}}
+    J3 --> F["prompt += --model gpt-6-sol --effort X"]
+  end
+```
+
+1. **Classify once.** The main-loop prompt is classified at `prompt.submit`, before the turn starts. A subagent's prompt is classified at `agent.spawn`.
+2. **Apply at the first request.** The decision is applied to the turn's first model request (`turn.step`) and reused by every later request of that turn, or of that subagent. Effort never changes inside a tool loop.
+3. **Re-check every request.** The effort ceiling is checked against the model actually sent on each request, so a fallback to a smaller model never carries an effort meant for a bigger one.
+
+## Quick start
+
+**Requirements:** Claude Code **2.1.259+**, function hooks enabled, and a [TypeSafe](https://typesafe.ai) API key. Without a key the router still runs on Claude Code's built-in classifier, which reports no confidence and so can only raise effort, never lower it.
+
+```sh
+git clone https://github.com/DmitryBMsk/jev-router.git ~/src/jev-router
+
+# load it for every project: a user-level skills folder is auto-loaded as jev-model-router@skills-dir
+ln -s ~/src/jev-router ~/.claude/skills/jev-model-router
+```
+
+Add this to `~/.claude/settings.json`. These are the recommended effort-only settings, and the defaults in the code differ from them, as noted below:
+
+```jsonc
+{
+  "env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1" },
+  "pluginConfigs": {
+    "jev-model-router@skills-dir": {
+      "options": {
+        "typesafeApiKey": "<your TypeSafe key>",
+        "provider": "typesafe",
+        "timeoutMs": 1500,
+
+        "routeMainEffort": true,
+        "routeSubagentEffort": true,
+        "routeMainModel": false,          // default false
+        "routeSubagentModel": false,      // default TRUE in code: set false for effort-only
+        "codexFastModel": "gpt-6-sol",    // default gpt-6-luna: pin Codex to one model
+
+        "mainEffortFloor": "medium",
+        "mainBalancedEffortFloor": "high",
+        "mainEffortCeiling": "high"
+      }
+    }
+  }
+}
+```
+
+Start `claude`. The first routed turn prints `[jev-model-router] ready on typesafe …; routing subagent effort, main effort`.
+
+<details>
+<summary><b>One session only, or a headless worker</b></summary>
+
+```sh
+CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir ~/src/jev-router
+```
+
+Loaded this way the plugin's id is plain `jev-model-router`, so its options go under `"pluginConfigs": { "jev-model-router": { … } }`, for example in a file passed with `--settings`. For an isolated `claude -p` worker use `--restricted`, not `--safe-mode`: `--safe-mode` also switches off hooks loaded with `--plugin-dir`.
+
+`claude plugin validate ~/src/jev-router` prints every event the plugin hooks and every `$` call it makes.
+
+</details>
 
 ## How it decides
 
-TypeSafe's API reports a `confidence` per answer. The Gateway's answer shape carries **no `confidence` field**, so on that backend confidence is read as the highest probability in the distribution — and that distribution is itself optional in the schema, in which case confidence is absent and the threshold does not fire.
+Jev answers three questions in a single request:
 
-The two mistakes do not cost the same, so they do not clear the same bar:
+| Question | Shape | Meaning |
+|---|---|---|
+| `tier` | choice of 3 | mechanical and local · ordinary engineering · hard or high-stakes. The decision model never sees a model name. |
+| `effort` | score 0–3 | how much step-by-step reasoning the task needs: `low` · `medium` · `high` · `xhigh` |
+| `risky` | probability | does it touch production, money, credentials or state that cannot be undone? |
 
-- Spending **more** (a bigger model, more reasoning) needs `minUpgradeConfidence`, 0.3 by default. Being wrong costs money.
-- Spending **less** needs `minDowngradeConfidence`, 0.6 by default. Being wrong means a task handled by too small a model or too little thought.
-- `risky` above 0.7 takes the deep tier and real reasoning, past both bars. That one is not a confidence question.
-- A backend that reports no confidence at all — the Gateway without a distribution, or the built-in classifier — may only move a request **up**. Spending less on an unmeasured hunch is the bad trade.
-- A model id matching no tier, or a numeric effort (the caller's own scale), has no knowable direction: the model gets the gentler upgrade bar, and a numeric effort is left alone.
+The two kinds of mistake do not cost the same, so they do not clear the same bar:
 
-Every other failure — a non-2xx response, a timeout, a malformed body, a thrown error — leaves the request exactly as the engine built it. The router never blocks a turn.
+- **Spending more** needs `minUpgradeConfidence` (0.3). A wrong call costs money.
+- **Spending less** needs `minDowngradeConfidence` (0.6). A wrong call is a task done with too little thought.
+- **`risky` above 0.7** forces at least `high` effort past both bars. It can raise effort but never lower it.
+- **No confidence reported** (the built-in classifier, or the Gateway without a distribution) means the router may only move effort **up**.
 
-A slash command with nothing after it (`/simplify`) is not classified: the decision model would see only the command's name, never what the command does. Its turn keeps the session's model and effort. With text after the name, the prompt is classified like any other.
+On top of the decision sit three policy limits. They apply without a confidence check:
 
-## What you see in the transcript
+| Option | Effect |
+|---|---|
+| `mainEffortFloor` | lowest effort a turn may get, so a short "check this" prompt is not sent at `low` |
+| `mainBalancedEffortFloor` | higher floor for a task read as ordinary engineering |
+| `mainEffortCeiling` | highest effort below the deep tier, so `xhigh`/`max` are kept for opus-class models |
 
-With `logDecisions` on (the default), the router reports every step of its own
-work, because nothing else in Claude Code shows it: the model and effort it
-rewrites are parameters of each request, not the session's settings, so the
-status line, the header and the effort box never move whatever it decides.
+A slash command with nothing after it (`/simplify`) is not classified, because Jev would only see the command's name. That turn keeps the session's effort.
+
+## Subagents
+
+The Agent tool has no effort parameter, so the router sets a subagent's effort from inside its loop:
+
+1. At `agent.spawn` it classifies the subagent's prompt, description and type.
+2. When the spawn resolves, it stores the decision by `agentId`.
+3. At the subagent's first `turn.step` it applies the effort, then reuses it for every later request and turn of that agent. If the first request overtakes the spawn, it waits for the spawn once, up to `timeoutMs`.
+
+Subagents use the same floor and ceiling as the main loop. Some subagents are left alone:
+
+| Case | Behaviour |
+|---|---|
+| definition pins `effort:` in its `.md` file | kept: `effort pinned by definition (medium)` |
+| `--agents` / registered definition pins an effort on the session's model | kept, detected when its effort differs from the session's: `effort set by agent definition (high, session medium)` |
+| model takes no effort (Haiku 4.5) | nothing sent: `model takes no effort` |
+| fork, Codex delegation, or a plugin's own `$.agent.spawn` | untouched |
+
+**Known limits.** The hook API does not say whether a subagent's effort was pinned. The router infers it, so a definition pinned to *the same level as the session* looks unpinned and may be routed. A pin on a *different* model given through `--agents` is not detected either. To make a pin certain, put `effort:` in the agent's `.md` file.
+
+## Codex delegations
+
+A `codex:codex-rescue` spawn gets `--model` and `--effort` flags prepended to its prompt, taken from the same decision. The rescue agent passes them on to Codex. With `codexFastModel` set to the same model as the other rungs, only the effort varies:
+
+| Decision | Codex flags |
+|---|---|
+| no decision / ordinary | `gpt-6-sol` · `low` |
+| ordinary, high effort | `gpt-6-sol` · `medium` |
+| hard | `gpt-6-sol` · `high` (`xhigh` when the effort reads `xhigh`) |
+| `risky` > 0.7 | `gpt-6-sol` · `xhigh` |
+
+A prompt that already names `--model` or `--effort` is left alone: an explicit choice wins.
+
+## Seeing what it did
+
+The effort the router sets is a parameter of each request, so Claude Code's status line and effort box never show it. The router reports its own work in three places.
+
+**Transcript lines** (when `logDecisions` is on):
 
 ```
-[jev-model-router] ready on typesafe (https://api.typesafe.ai/v1/systemone); routing subagent model, main effort
-[jev-model-router] jev: tier fast (0.87) · effort 0.4 → low (0.71) · risky 0.02 · 249ms
-[jev-model-router] main loop → effort low: fast (confidence 0.87)
-[jev-model-router] jev: tier fast (0.41) · effort 0.4 → low (0.38) · risky 0.01 · 210ms
-[jev-model-router] main loop: kept opus/medium, wanted haiku/low (confidence 0.41)
+[jev-model-router] ready on typesafe (https://api.typesafe.ai/v1/systemone); routing subagent effort, main effort
+[jev-model-router] jev: tier deep (0.98) · effort 2.1 → high (0.70) · risky 0.09 · 612ms
+[jev-model-router] main loop → effort high: deep (confidence 0.98)
+[jev-model-router] general-purpose → effort high: deep (confidence 0.98)
+[jev-model-router] ra-impl-medium: effort pinned by definition (medium)
 ```
 
-- The first line appears once per session, the first time a hook runs. It is
-  the proof the module loaded and which backend answers it.
-- A `jev:` line is what the decision model replied, before any policy is
-  applied — the tier, the effort score and the risk, each with its confidence,
-  and how long the call took.
-- The line under it is what the policy then did. The last pair above is a
-  working router declining to act: it wanted to spend less but did not clear
-  `minDowngradeConfidence`.
+**A status line**, replaced as it goes: `jev · deep 0.98 → high`.
 
-It also keeps a one-line status on screen, replaced as it goes:
+**A decision log**, one JSONL file per session in `~/.claude/jev-router/<session-id>.jsonl` (no `--debug` needed, no prompt text):
 
-```
-jev · fast 0.87 → haiku/low
-jev · fast 0.41 · unchanged
+```json
+{"ts":"2026-10-04T10:12:41.204Z","event":"subagent","agentId":"ad05ecf8…","agentType":"general-purpose",
+ "tier":"deep","confidence":0.98,"effort":2.02,"effortConfidence":0.68,"risky":0.07,
+ "from":{"model":"claude-sonnet-5-5","effort":"medium","source":"parent"},
+ "applied":{"effort":"high"},"reason":"deep (confidence 0.98)"}
 ```
 
-`confidence n/d` means the backend reported no confidence, which the built-in
-classifier never does and the Gateway does whenever its probability
-distribution is absent; the `ready on` line says which one answered.
-
-**No lines at all** has three causes, and only the last is the module failing
-to load. Check them in this order:
-
-1. **You ran `claude -p` (or the SDK).** A headless run has no transcript and
-   no status row: every line still goes to the debug log,
-   `~/.claude/debug/<session-id>.txt` (a `.txt`, not a `.log`; `latest` is a
-   symlink to the newest), and an SDK host receives each one as `ui_log`. The
-   router is working; look there.
-2. **The plugin was never loaded.** Claude Code adopts a plugin from a
-   project's `.claude/skills/` (where `--mod` writes it) only once the
-   project is trusted: it is repository content, so an untrusted folder's
-   `.claude/` is not read at all, and `claude -p` never asks. Open `claude`
-   interactively in the folder and accept the trust prompt, or name the
-   plugin explicitly with `--plugin-dir` (see Install). `claude --debug`
-   settles it: a loaded module prints
-   `hooks module jev-model-router@skills-dir loaded (worker, …); events: prompt.submit,turn.step,agent.spawn`
-   (`@inline` when loaded with `--plugin-dir`); `Found N plugins` without it
-   means the plugin is not in the session.
-3. **Function hooks are off.** Without `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`
-   the debug log says `installed plugins' hooks modules not loaded: rollout
-   flag (tengu_plugin_hooks_modules) is off`. Set the flag; Claude Code must
-   be 2.1.259+.
-
-A `ready on the built-in classifier, no key set` line when you did set a key
-means the key sits under the wrong `pluginConfigs` entry: the key must match
-the plugin's id, which depends on how it was loaded (see Options).
-
-## Privacy
-
-With a key set, the prompt text leaves the machine and goes to whichever backend the key belongs to. The main-loop path sends the prompt; the subagent path sends the subagent's prompt, its description and its agent type. Nothing else. With no key set, nothing leaves the machine.
+`from` is what the request would have used untouched. `source` says where its model came from: `call`, `definition` or `parent`. `ran` appears when the first request used a different model. `applied` is what the router changed. For cost analysis, join these records to the per-request `usage` in your session transcripts by timestamp.
 
 ## Options
 
-```
-  typesafeApiKey:         string  TypeSafe API key (preferred: it reports a confidence)
-  gatewayApiKey:          string  Vercel AI Gateway key
-  provider:               string  "auto" | "typesafe" | "gateway" | "builtin"
-  typesafeBaseUrl:        string  empty uses https://api.typesafe.ai
-  typesafeModel:          string  empty uses jev-latest
-  gatewayBaseUrl:         string  empty uses https://ai-gateway.vercel.sh/v4/ai
-  gatewayModel:           string  empty uses typesafe-ai/jev
-  fastModel:              string  fast tier, alias or full id (default "haiku")
-  balancedModel:          string  balanced tier, alias or full id (default "sonnet")
-  deepModel:              string  deep tier, alias or full id (default "opus")
-  minUpgradeConfidence:   number  bar to spend more (default 0.3)
-  minDowngradeConfidence: number  bar to spend less (default 0.6)
-  routeSubagentModel:     boolean model of each subagent (default true)
-  routeSubagentEffort:    boolean effort of each Claude subagent (default true)
-  routeCodexDelegation:   boolean give codex:codex-rescue spawns --model/--effort for Codex from the same decision (default true)
-  codexAgentTypes:        string comma-separated agent types treated as Codex delegation (default codex:codex-rescue)
-  codexFastModel / codexBalancedModel / codexDeepModel: Codex ladder (default gpt-6-luna / gpt-6-sol / gpt-6-sol: sol carries hard work, effort carries difficulty; no decision → sol/low)
-  mainModelFloor:         string lowest tier the main loop's model may go to: fast|balanced|deep (default balanced)
-  mainMinModelDowngradeConfidence: number confidence a main-loop model downgrade needs (default 0.9; effort keeps minDowngradeConfidence)
-  mainModelMaxContextTokens: number above this many context tokens a main-loop model switch is held, except a return to the session's starting model (default 80000)
-  routeMainEffort:        boolean effort of the main loop (default true)
-  routeMainModel:         boolean model of the main loop (default false)
-  timeoutMs:              number  latency budget per classification (default 800)
-  logDecisions:           boolean log each decision (default true)
-```
+Set them under `pluginConfigs.<id>.options` in **user** settings (`~/.claude/settings.json`), with `--settings <file>`, in managed settings or through `/config`. The `<id>` depends on how the plugin was loaded: `jev-model-router@skills-dir` when it is auto-loaded from a skills folder, plain `jev-model-router` with `--plugin-dir`. Under the wrong key every option stays at its default, and the `ready on` line says `no key set`.
 
-The three tiers take an alias (`haiku`, `sonnet`, `opus`) or a full model id.
-A subagent is spawned with the name as given, the way the Agent tool takes it;
-the main loop's request needs an id, so there an alias is resolved to the
-family's current id (`haiku` → `claude-haiku-4-5-20251001`, `sonnet` →
-`claude-sonnet-5-5`, `opus` → `claude-opus-5-5`). Set a full id to pin a
-specific version. A decision for the tier the session already runs is not a
-change, so a session on `claude-opus-5-5[1m]` keeps its 1M-context id.
+<details open>
+<summary><b>Backend</b></summary>
 
-Declared in `.claude-plugin/plugin.json` (`userConfig`). Set them in `/config`, in user settings (`~/.claude/settings.json`, not project settings), with `--settings <file>` or in managed settings:
+| Option | Default | |
+|---|---|---|
+| `typesafeApiKey` | — | TypeSafe API key. Preferred, because it reports a calibrated confidence. |
+| `gatewayApiKey` | — | Vercel AI Gateway key. Confidence is read from the optional distribution. |
+| `provider` | `auto` | `auto` · `typesafe` · `gateway` · `builtin` |
+| `typesafeBaseUrl` / `typesafeModel` | `https://api.typesafe.ai` / `jev-latest` | |
+| `gatewayBaseUrl` / `gatewayModel` | `https://ai-gateway.vercel.sh/v4/ai` / `typesafe-ai/jev` | |
+| `timeoutMs` | `800` | time limit for each classification. Past it the request goes out unchanged. |
 
-```json
-{ "pluginConfigs": { "jev-model-router": { "options": { "typesafeApiKey": "" } } } }
-```
+</details>
 
-The entry's key is the plugin's id, and the id follows how the plugin was
-loaded: `"jev-model-router@skills-dir"` when auto-loaded from `.claude/skills/`
-(the `--mod` install), `"jev-model-router"` with `--plugin-dir`. Under the
-wrong key every option stays at its default, and the `ready on` line reports
-`no key set`.
+<details open>
+<summary><b>What to route</b></summary>
 
-## Install
+| Option | Default | |
+|---|---|---|
+| `routeMainEffort` | `true` | effort of the main conversation |
+| `routeSubagentEffort` | `true` | effort of each Claude subagent |
+| `routeCodexDelegation` | `true` | `--model` / `--effort` for `codex:codex-rescue` spawns |
+| `routeMainModel` | `false` | model of the main conversation (breaks the prompt cache, see above) |
+| `routeSubagentModel` | `true` | model of each subagent. **Set `false` for effort-only.** |
+
+</details>
+
+<details>
+<summary><b>Policy</b></summary>
+
+| Option | Default | |
+|---|---|---|
+| `minUpgradeConfidence` | `0.3` | confidence needed to spend more |
+| `minDowngradeConfidence` | `0.6` | confidence needed to spend less |
+| `mainEffortFloor` | — | lowest effort: `low`·`medium`·`high`·`xhigh` |
+| `mainBalancedEffortFloor` | — | floor for a task read as ordinary engineering |
+| `mainEffortCeiling` | — | highest effort below the deep tier |
+| `mainModelFloor` | `balanced` | lowest tier the main loop's model may go to (model routing only) |
+| `mainMinModelDowngradeConfidence` | `0.9` | confidence needed for a main-loop model downgrade |
+| `mainModelMaxContextTokens` | `80000` | above this context size, a main-loop model switch is held, except a return to the session's starting model |
+| `fastModel` / `balancedModel` / `deepModel` | `haiku` / `sonnet` / `opus` | the three tiers, as aliases or full ids |
+
+</details>
+
+<details>
+<summary><b>Codex and logging</b></summary>
+
+| Option | Default | |
+|---|---|---|
+| `codexAgentTypes` | `codex:codex-rescue` | comma-separated agent types treated as a Codex delegation |
+| `codexFastModel` / `codexBalancedModel` / `codexDeepModel` | `gpt-6-luna` / `gpt-6-sol` / `gpt-6-sol` | the Codex ladder. Make all three the same to route effort only. |
+| `logDecisions` | `true` | transcript lines and the status line |
+| `decisionLog` | `true` | the per-session JSONL decision log |
+| `decisionLogDir` | `~/.claude/jev-router` | where it is written |
+
+</details>
+
+## Troubleshooting
+
+**No `[jev-model-router]` lines at all.** Check these in order:
+
+1. **It is a headless run.** `claude -p` and the SDK have no transcript, so every line goes to `~/.claude/debug/<session-id>.txt`. The decision log is written either way.
+2. **The plugin is not loaded.** `claude --debug` should print `hooks module jev-model-router@skills-dir loaded …; events: prompt.submit,turn.step,agent.spawn`. A plugin in a *project's* `.claude/skills/` is only read once that project is trusted; a user-level `~/.claude/skills/` link has no such step.
+3. **Function hooks are off.** The debug log says `rollout flag (tengu_plugin_hooks_modules) is off`. Set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`.
+
+**`ready on the built-in classifier, no key set` when you did set a key:** the key is under the wrong `pluginConfigs` id. See [Options](#options).
+
+**Effort never moves:** check the `reason` in the decision log. `kept …, wanted …` means a floor or ceiling held it, or the confidence was below the bar. `no decision` means the classification timed out: raise `timeoutMs`.
+
+## Privacy and failure modes
+
+- **What leaves the machine:** with a key set, the main-loop prompt text, and for a subagent its prompt, description and agent type, all sent to the backend the key belongs to. Nothing else. With no key, nothing leaves the machine.
+- **Fail-open:** a timeout, a non-2xx response, a malformed body or a thrown error all leave the request exactly as Claude Code built it. The router never blocks a turn or a subagent.
+- **Cost of a decision:** one HTTP call per turn and per subagent spawn, bounded by `timeoutMs`.
+
+## Development
 
 ```sh
-npx claude-code-templates@latest --mod productivity/jev-model-router
-CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude
+bun test            # pure policy tests: hooks/policy.ts
 ```
 
-`--mod` writes the plugin to `.claude/skills/jev-model-router/` in the project,
-and Claude Code auto-loads it as `jev-model-router@skills-dir` **in a trusted
-project**: a folder's `.claude/` is repository content and is not read until
-you accept the trust prompt on the first interactive `claude` there (`-p`
-never asks, so a headless run in a fresh folder never sees it). The options
-then go under the `"jev-model-router@skills-dir"` key in `pluginConfigs` (see
-Options).
-
-For one session with hot reload, or in a folder you do not want to trust,
-name it on the command line instead — it loads as `jev-model-router@inline`
-and reads options from the `"jev-model-router"` key:
-
-```sh
-CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .claude/skills/jev-model-router
+```
+hooks/
+  jev-model-router.ts   wiring: prompt.submit · turn.step · agent.spawn
+  policy.ts             every decision as a pure function (route, effort ceiling, pins, Codex flags)
+  hooks.json            module manifest
+tests/policy.test.ts    bun:test
+.claude-plugin/
+  plugin.json           manifest and userConfig
 ```
 
-Either way, `claude plugin validate .claude/skills/jev-model-router` prints
-every event it hooks and every `$` call it makes.
+All decision logic lives in `policy.ts` and is unit-tested. The hook wiring has no automated tests and is checked with live `claude -p` sessions against the decision log. `.types/` and `.claude-plugin/types/` are type declarations that Claude Code writes when it loads the plugin, so they are not in the repository, and `tsconfig.json` resolves only after a first load.
 
-## Tests
+This is an **early-access** API: mods need Claude Code 2.1.259+, and the `$` API may change between releases. The plugin is typed against [Anthropic's declarations](https://github.com/anthropics/claude-code/tree/main/mods). It talks to both backends over `$.http.fetch`, because a mod runs without `node_modules`. The TypeSafe wire shape follows `@typesafe-ai/sdk` v0.6.0.
 
-```sh
-bun test cli-tool/components/mods/productivity/jev-model-router/tests
-```
+## Credits and license
 
-**Early access.** Mods need Claude Code 2.1.259+ with `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`; the `$` API may change between releases. Typed against Anthropic's declarations: https://github.com/anthropics/claude-code/tree/main/mods
+Based on the `jev-model-router` mod from [davila7/claude-code-templates](https://github.com/davila7/claude-code-templates) by Daniel (San) Ávila. This fork adds effort-only routing, subagent effort through `turn.step`, the Codex effort ladder, definition-pin detection and the measurements above.
 
-A mod runs without `node_modules`, so neither `@typesafe-ai/sdk` nor the AI SDK is available here: both backends are spoken to over HTTP through `$.http.fetch`. The TypeSafe wire shape was read from `@typesafe-ai/sdk` v0.6.0; the Gateway's, which is `experimental` in the AI SDK (`experimental_evaluate`, 7.0.105+) and not documented publicly, from `@ai-sdk/gateway` v4.0.86 and `@ai-sdk/provider` v4.0.17. Either may change.
+MIT. See [LICENSE](LICENSE).
